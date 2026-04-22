@@ -9,79 +9,79 @@ app.use(express.json());
 const {
   MPESA_CONSUMER_KEY,
   MPESA_CONSUMER_SECRET,
-  MPESA_SHORTCODE,        // Till Number: 3291421
-  MPESA_PASSKEY,          // From Daraja production app
-  CALLBACK_URL,           // e.g. https://sipcycle.onrender.com/callback
-  APPS_SCRIPT_URL,        // Google Apps Script Web App URL
-  PORT = 3000
+  MPESA_SHORTCODE,      // Production Till: 3291421
+  MPESA_PASSKEY,        // Production passkey from Daraja
+  CALLBACK_URL,         // e.g. https://sipcycle.onrender.com/callback
+  APPS_SCRIPT_URL,      // Google Apps Script Web App URL
+  PORT = 3000,
 } = process.env;
 
-const MPESA_ENV = (process.env.MPESA_ENVIRONMENT || 'sandbox').toLowerCase();
-const MPESA_BASE = MPESA_ENV === 'production'
-  ? 'https://api.safaricom.co.ke'
-  : 'https://sandbox.safaricom.co.ke';
+// Sandbox constants (used when MPESA_ENV=sandbox)
+const SANDBOX_SHORTCODE = '174379';
+const SANDBOX_PASSKEY   = 'bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919';
+const IS_SANDBOX = (process.env.MPESA_ENV || 'sandbox') === 'sandbox';
+
+const STK_SHORTCODE = IS_SANDBOX ? SANDBOX_SHORTCODE : MPESA_SHORTCODE;
+const STK_PASSKEY   = IS_SANDBOX ? SANDBOX_PASSKEY   : MPESA_PASSKEY;
+const MPESA_BASE    = IS_SANDBOX
+  ? 'https://sandbox.safaricom.co.ke'
+  : 'https://api.safaricom.co.ke';
 
 // ─── HELPERS ───────────────────────────────────────────────────────────────
+function getTimestamp() {
+  const now = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  return (
+    now.getFullYear() +
+    pad(now.getMonth() + 1) +
+    pad(now.getDate()) +
+    pad(now.getHours()) +
+    pad(now.getMinutes()) +
+    pad(now.getSeconds())
+  );
+}
 
-async function getToken() {
-  const creds = Buffer.from(`${MPESA_CONSUMER_KEY}:${MPESA_CONSUMER_SECRET}`).toString('base64');
+async function getAccessToken() {
+  const credentials = Buffer.from(`${MPESA_CONSUMER_KEY}:${MPESA_CONSUMER_SECRET}`).toString('base64');
   const res = await axios.get(
     `${MPESA_BASE}/oauth/v1/generate?grant_type=client_credentials`,
-    { headers: { Authorization: `Basic ${creds}` } }
+    { headers: { Authorization: `Basic ${credentials}` } }
   );
   return res.data.access_token;
 }
 
-function getTimestamp() {
-  return new Date().toISOString().replace(/[-T:.Z]/g, '').slice(0, 14);
-}
-
-async function appendToSheet(row) {
-  if (!APPS_SCRIPT_URL) {
-    console.warn('APPS_SCRIPT_URL not set - skipping sheet logging');
-    return;
-  }
-  await axios.post(APPS_SCRIPT_URL, {
-    date:     row[0],
-    time:     row[1],
-    customer: row[2],
-    amount:   row[3],
-    ref:      row[4],
-    notes:    row[5]
-  });
+async function appendToSheet(rowData) {
+  if (!APPS_SCRIPT_URL) return;
+  await axios.post(APPS_SCRIPT_URL, { row: rowData });
 }
 
 // ─── ROUTES ────────────────────────────────────────────────────────────────
 
+// Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'Sip Cycle M-Pesa Server Running' });
+  res.json({ status: 'ok', env: IS_SANDBOX ? 'sandbox' : 'production' });
 });
 
-app.post('/stkpush', async (req, res) => {
+// STK Push (for customer-initiated payments)
+app.post('/stk-push', async (req, res) => {
   try {
-    const { phone, amount, description = 'Water Purchase' } = req.body;
-    if (!phone || !amount) {
-      return res.status(400).json({ error: 'phone and amount are required' });
-    }
-
-    const token = await getToken();
+    const { phone, amount, accountRef = 'SipCycle' } = req.body;
+    const token = await getAccessToken();
     const timestamp = getTimestamp();
-
-    const shortcode = MPESA_ENV === 'production' ? MPESA_SHORTCODE : '174379';
-    const txType = MPESA_ENV === 'production' ? 'CustomerBuyGoodsOnline' : 'CustomerPayBillOnline';
+    const password = Buffer.from(`${STK_SHORTCODE}${STK_PASSKEY}${timestamp}`).toString('base64');
 
     const payload = {
-      BusinessShortCode: shortcode,
-      Password: Buffer.from(`${shortcode}${MPESA_PASSKEY}${timestamp}`).toString('base64'),
+      BusinessShortCode: STK_SHORTCODE,
+      Password: password,
       Timestamp: timestamp,
-      TransactionType: txType,
-      Amount: Math.round(amount),
+      TransactionType: 'CustomerPayBillOnline',
+      Amount: amount,
       PartyA: phone,
-      PartyB: shortcode,
+      PartyB: STK_SHORTCODE,
       PhoneNumber: phone,
-      CallBackURL: CALLBACK_URL,
-      AccountReference: 'SipCycle',
-      TransactionDesc: description
+      CallBackURL: CALLBACK_URL || `https://sipcycle.onrender.com/callback`,
+      AccountReference: accountRef,
+      TransactionDesc: 'Water Purchase',
     };
 
     const response = await axios.post(
@@ -90,50 +90,58 @@ app.post('/stkpush', async (req, res) => {
       { headers: { Authorization: `Bearer ${token}` } }
     );
 
-    res.json({
-      success: true,
-      CheckoutRequestID: response.data.CheckoutRequestID,
-      ResponseDescription: response.data.ResponseDescription
-    });
-
+    res.json(response.data);
   } catch (err) {
-    console.error('STK Push error:', err.response?.data || err.message);
-    res.status(500).json({ error: err.response?.data || err.message });
+    const detail = err.response?.data || err.message;
+    console.error('STK Push error:', JSON.stringify(detail));
+    res.status(500).json({ error: detail });
   }
 });
 
+// STK Callback
 app.post('/callback', async (req, res) => {
   res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
   try {
     const body = req.body?.Body?.stkCallback;
     if (!body) return;
-    const { ResultCode, ResultDesc, CallbackMetadata } = body;
+    const { ResultCode, CallbackMetadata } = body;
     if (ResultCode !== 0) {
-      console.log(`Payment failed: ${ResultDesc}`);
+      console.log(`STK failed with code ${ResultCode}`);
       return;
     }
     const items = CallbackMetadata?.Item || [];
-    const get = (name) => items.find(i => i.Name === name)?.Value ?? '';
-    const amount   = get('Amount');
-    const mpesaRef = get('MpesaReceiptNumber');
-    const phone    = get('PhoneNumber');
-    const date     = get('TransactionDate');
-    const d = String(date);
+    const get = name => items.find(i => i.Name === name)?.Value;
+
+    const amount    = get('Amount');
+    const mpesaRef  = get('MpesaReceiptNumber');
+    const phone     = get('PhoneNumber');
+    const transTime = get('TransactionDate');
+
+    const d = String(transTime);
     const formattedDate = `${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}`;
     const formattedTime = `${d.slice(8,10)}:${d.slice(10,12)}:${d.slice(12,14)}`;
-    let notes = 'M-Pesa STK Push';
-    if (amount == 150)      notes = '20L Dispenser';
-    else if (amount == 90)  notes = '10L Jerry Can';
-    else if (amount == 40)  notes = '5L Bottle';
-    else if (amount == 20)  notes = '2L Bottle';
-    else if (amount == 10)  notes = '1L Bottle';
+
+    let notes = 'STK Push';
+    const amt = parseFloat(amount);
+    if (amt === 150) notes = '20L Dispenser';
+    else if (amt === 90)  notes = '10L Jerry Can';
+    else if (amt === 40)  notes = '5L Bottle';
+    else if (amt === 20)  notes = '2L Bottle';
+    else if (amt === 10)  notes = '1L Bottle';
+
     await appendToSheet([formattedDate, formattedTime, String(phone), amount, mpesaRef, notes]);
-    console.log(`STK payment logged: ${mpesaRef} | KES ${amount} | ${phone}`);
+    console.log(`STK logged: ${mpesaRef} | KES ${amount} | ${phone}`);
   } catch (err) {
-    console.error('Callback processing error:', err.message);
+    console.error('Callback error:', err.message);
   }
 });
 
+// C2B Validation
+app.post('/c2b/validate', (req, res) => {
+  res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
+});
+
+// C2B Confirmation — logs till payments to Google Sheet
 app.post('/c2b/confirm', async (req, res) => {
   res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
   try {
@@ -142,22 +150,20 @@ app.post('/c2b/confirm', async (req, res) => {
     const formattedDate = `${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}`;
     const formattedTime = `${d.slice(8,10)}:${d.slice(10,12)}:${d.slice(12,14)}`;
     const customer = `${FirstName || ''} ${LastName || ''}`.trim() || String(MSISDN);
+
     let notes = 'Till Payment';
     const amt = parseFloat(TransAmount);
-    if (amt == 150)      notes = '20L Dispenser';
-    else if (amt == 90)  notes = '10L Jerry Can';
-    else if (amt == 40)  notes = '5L Bottle';
-    else if (amt == 20)  notes = '2L Bottle';
-    else if (amt == 10)  notes = '1L Bottle';
+    if (amt === 150) notes = '20L Dispenser';
+    else if (amt === 90)  notes = '10L Jerry Can';
+    else if (amt === 40)  notes = '5L Bottle';
+    else if (amt === 20)  notes = '2L Bottle';
+    else if (amt === 10)  notes = '1L Bottle';
+
     await appendToSheet([formattedDate, formattedTime, customer, TransAmount, TransID, notes]);
     console.log(`Till payment logged: ${TransID} | KES ${TransAmount} | ${customer}`);
   } catch (err) {
     console.error('C2B confirm error:', err.message);
   }
-});
-
-app.post('/c2b/validate', (req, res) => {
-  res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
 });
 
 app.listen(PORT, () => {
