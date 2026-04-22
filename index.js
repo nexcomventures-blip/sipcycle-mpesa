@@ -16,10 +16,12 @@ const {
   PORT = 3000,
 } = process.env;
 
-// Sandbox constants (used when MPESA_ENV=sandbox)
+// Sandbox constants
 const SANDBOX_SHORTCODE = '174379';
 const SANDBOX_PASSKEY   = 'bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919';
-const IS_SANDBOX = (process.env.MPESA_ENV || 'sandbox') === 'sandbox';
+// Support both MPESA_ENVIRONMENT and MPESA_ENV
+const MPESA_ENV_VALUE = (process.env.MPESA_ENVIRONMENT || process.env.MPESA_ENV || 'sandbox').toLowerCase();
+const IS_SANDBOX = MPESA_ENV_VALUE === 'sandbox';
 
 const STK_SHORTCODE = IS_SANDBOX ? SANDBOX_SHORTCODE : MPESA_SHORTCODE;
 const STK_PASSKEY   = IS_SANDBOX ? SANDBOX_PASSKEY   : MPESA_PASSKEY;
@@ -59,7 +61,7 @@ async function appendToSheet(rowData) {
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', env: IS_SANDBOX ? 'sandbox' : 'production' });
+  res.json({ status: 'ok', env: IS_SANDBOX ? 'sandbox' : 'production', shortcode: STK_SHORTCODE });
 });
 
 // STK Push (for customer-initiated payments)
@@ -167,5 +169,5 @@ app.post('/c2b/confirm', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Sip Cycle M-Pesa server running on port ${PORT}`);
+  console.log(`Sip Cycle M-Pesa server running on port ${PORT} [${IS_SANDBOX ? 'SANDBOX' : 'PRODUCTION'}]`);
 });
