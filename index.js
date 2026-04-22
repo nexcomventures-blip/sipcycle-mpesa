@@ -1,7 +1,6 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
-const { google } = require('googleapis');
 
 const app = express();
 app.use(express.json());
@@ -13,9 +12,7 @@ const {
   MPESA_SHORTCODE,        // Till Number: 3291421
   MPESA_PASSKEY,          // From Daraja production app
   CALLBACK_URL,           // e.g. https://sipcycle.onrender.com/callback
-  GOOGLE_SHEET_ID,        // 1EVDcXDdVbk8sLIYs3tJtVzP9Dml9L2nJCaOD1PDWU5I
-  GOOGLE_SERVICE_ACCOUNT_EMAIL,
-  GOOGLE_PRIVATE_KEY,
+  APPS_SCRIPT_URL,        // Google Apps Script Web App URL
   PORT = 3000
 } = process.env;
 
@@ -23,7 +20,7 @@ const MPESA_BASE = 'https://api.safaricom.co.ke'; // Production
 
 // ─── HELPERS ───────────────────────────────────────────────────────────────
 
-// Get OAuth token
+// Get M-Pesa OAuth token
 async function getToken() {
   const creds = Buffer.from(`${MPESA_CONSUMER_KEY}:${MPESA_CONSUMER_SECRET}`).toString('base64');
   const res = await axios.get(
@@ -44,20 +41,19 @@ function getTimestamp() {
   return new Date().toISOString().replace(/[-T:.Z]/g, '').slice(0, 14);
 }
 
-// Append a row to Google Sheets
-async function appendToSheet(values) {
-  const auth = new google.auth.JWT(
-    GOOGLE_SERVICE_ACCOUNT_EMAIL,
-    null,
-    GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-    ['https://www.googleapis.com/auth/spreadsheets']
-  );
-  const sheets = google.sheets({ version: 'v4', auth });
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: GOOGLE_SHEET_ID,
-    range: 'Transactions!A:F',
-    valueInputOption: 'USER_ENTERED',
-    requestBody: { values: [values] }
+// Send a row to Google Sheets via Apps Script Web App
+async function appendToSheet(row) {
+  if (!APPS_SCRIPT_URL) {
+    console.warn('⚠️  APPS_SCRIPT_URL not set — skipping sheet logging');
+    return;
+  }
+  await axios.post(APPS_SCRIPT_URL, {
+    date:     row[0],
+    time:     row[1],
+    customer: row[2],
+    amount:   row[3],
+    ref:      row[4],
+    notes:    row[5]
   });
 }
 
@@ -114,7 +110,7 @@ app.post('/stkpush', async (req, res) => {
   }
 });
 
-// M-Pesa Callback (Safaricom calls this after payment)
+// M-Pesa STK Push Callback (Safaricom calls this after payment)
 app.post('/callback', async (req, res) => {
   // Always respond 200 immediately so Safaricom doesn't retry
   res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
@@ -134,12 +130,12 @@ app.post('/callback', async (req, res) => {
     const items = CallbackMetadata?.Item || [];
     const get = (name) => items.find(i => i.Name === name)?.Value ?? '';
 
-    const amount      = get('Amount');
-    const mpesaRef    = get('MpesaReceiptNumber');
-    const phone       = get('PhoneNumber');
-    const date        = get('TransactionDate');
+    const amount   = get('Amount');
+    const mpesaRef = get('MpesaReceiptNumber');
+    const phone    = get('PhoneNumber');
+    const date     = get('TransactionDate');
 
-    // Format date: 20260422143022 → 2026-04-22
+    // Format date: 20260422143022 → 2026-04-22 / 14:30:22
     const d = String(date);
     const formattedDate = `${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}`;
     const formattedTime = `${d.slice(8,10)}:${d.slice(10,12)}:${d.slice(12,14)}`;
@@ -152,29 +148,24 @@ app.post('/callback', async (req, res) => {
     else if (amount == 20)  notes = '2L Bottle';
     else if (amount == 10)  notes = '1L Bottle';
 
-    // Log to Google Sheets: [Date, Time, Customer Phone, Amount, M-Pesa Ref, Notes]
     await appendToSheet([formattedDate, formattedTime, String(phone), amount, mpesaRef, notes]);
-
-    console.log(`✅ Payment logged: ${mpesaRef} | KES ${amount} | ${phone}`);
+    console.log(`✅ STK payment logged: ${mpesaRef} | KES ${amount} | ${phone}`);
 
   } catch (err) {
     console.error('Callback processing error:', err.message);
   }
 });
 
-// C2B Confirmation (for Till Number payments — walk-in customers)
+// C2B Confirmation (for Till Number walk-in payments)
 // Register this URL on Daraja as your Confirmation URL
 app.post('/c2b/confirm', async (req, res) => {
   res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
 
   try {
     const {
-      TransactionType,
       TransID,
       TransTime,
       TransAmount,
-      BusinessShortCode,
-      BillRefNumber,
       MSISDN,
       FirstName,
       LastName
@@ -201,7 +192,7 @@ app.post('/c2b/confirm', async (req, res) => {
   }
 });
 
-// C2B Validation (optional — approve/reject before payment)
+// C2B Validation (approve/reject before payment — always accept)
 app.post('/c2b/validate', (req, res) => {
   res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
 });
